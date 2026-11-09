@@ -1,0 +1,14 @@
+{
+  "name": "zerosettle-ghl-relay",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "deploy": "wrangler deploy",
+    "logs": "wrangler tail zerosettle-ghl-relay --format pretty"
+  },
+  "devDependencies": {
+    "wrangler": "^4.159.0"
+  }
+}
