@@ -32,6 +32,17 @@ npx wrangler secret put ZEROSETTLE_API_KEY
 
 You can also set them in the Cloudflare dashboard: Workers & Pages → zerosettle-ghl-relay → Settings → Variables and Secrets.
 
+## One worker per creator
+
+Each creator gets their own worker, with its own URL, secrets (its own ZeroSettle line's API key) and logs. The workers share the same code.
+
+| Creator | Worker | URL | Deploy |
+| --- | --- | --- | --- |
+| Ricky (e-com) | `zerosettle-ghl-relay` | `https://zerosettle-ghl-relay.ghl-imessage.workers.dev` | `npx wrangler deploy` |
+| Trading | `zerosettle-ghl-relay-trading` | `https://zerosettle-ghl-relay-trading.ghl-imessage.workers.dev` | `npx wrangler deploy --env trading` |
+
+To add another creator, add an `[env.<name>]` block to `wrangler.toml`, deploy it with `--env <name>`, and set both secrets with `--env <name>`.
+
 ## Commands
 
 ```bash

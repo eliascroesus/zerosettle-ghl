@@ -11,3 +11,11 @@ enabled = true
 # Secrets (not stored in this file):
 #   RELAY_SECRET       - value GoHighLevel must send in the "x-relay-secret" header
 #   ZEROSETTLE_API_KEY - ZeroSettle API key
+
+# Second creator (trading offer): a separate worker with its own URL, secrets and logs.
+# Deploy with: npx wrangler deploy --env trading
+[env.trading]
+name = "zerosettle-ghl-relay-trading"
+
+[env.trading.observability]
+enabled = true
