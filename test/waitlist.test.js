@@ -113,14 +113,46 @@ test("a booked lead who never opted in is sent now if a slot is free, otherwise 
     assert.equal((await booked.json()).position, 1);
   }));
 
-test("a booked lead without text who isn't on the waitlist is ignored", () =>
+/** A booking webhook as the trading setup sends it: just the contact, no text. */
+function booking(n) {
+  const body = ghl(n);
+  delete body.customData.text;
+  return body;
+}
+
+test("booking during the opt-in workflow's wait step puts them first once their message comes in", () =>
   withWaitlist({}, async (relay) => {
-    const body = ghl(1);
-    delete body.customData.text;
-    const res = await relay.post(body, { path: "/booked" });
-    assert.equal(res.status, 200);
-    assert.equal((await res.json()).status, "ignored");
+    await optIn(relay, 1, 2, 3); // slots full, 3 waiting
+
+    // Lead 4 books before their opt-in webhook (still in the 3-minute wait) fires.
+    const booked = await relay.post(booking(4), { path: "/booked" });
+    assert.equal(booked.status, 200);
+    assert.equal((await booked.json()).status, "booked");
+    relay.clearCalls();
+
+    // Their opt-in webhook arrives: they go to the front, tagged as priority.
+    const res = await relay.post(ghl(4));
+    assert.equal(res.status, 202);
+    assert.deepEqual(await res.json(), { status: "waiting", position: 1, waiting: 2 });
+    assert.deepEqual(relay.tagCalls(), ["POST contact4 jean-imessage-waiting,jean-imessage-priority"]);
+
+    // A newer, non-booked opt-in still goes behind them.
+    assert.equal((await (await relay.post(ghl(5))).json()).position, 2);
+
+    await relay.tick(day(1));
+    assert.deepEqual(relay.sentTo(), [phone(4), phone(5)]);
+  }));
+
+test("booking during the wait step with a free slot sends their one message as normal", () =>
+  withWaitlist({}, async (relay) => {
+    await relay.post(booking(1), { path: "/booked" });
     assert.equal(relay.calls.length, 0);
+    const res = await relay.post(ghl(1));
+    assert.equal(res.status, 200);
+    assert.deepEqual(relay.zeroSettleCalls().map((c) => c.body), [{ to: phone(1), text: "Hi Lead1!" }]);
+    // Booking again later changes nothing.
+    assert.deepEqual(await (await relay.post(booking(1), { path: "/booked" })).json(), { status: "already_sent" });
+    assert.equal(relay.zeroSettleCalls().length, 1);
   }));
 
 test("booking a call after already being messaged does nothing", () =>

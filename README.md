@@ -50,7 +50,7 @@ The trading line's ZeroSettle plan only allows `DAILY_LIMIT` (5) new conversatio
 - **Who uses a slot:** only the first message to a new number. Messages to someone who was already messaged go straight through. More messages for someone who is still waiting are skipped until their first one goes out.
 - **Order:** people who booked a call go first, then the newest opt-ins.
 - **Daily reset:** a new sending day starts at `RESET_HOUR` (12, noon) in `RESET_TIMEZONE` (America/New_York). An hourly cron sends the waitlist first, until the day's slots are used up. Any slots left over go to new opt-ins as they arrive.
-- **Booked calls:** a GoHighLevel workflow (trigger: tag `jean-booked` added, or Appointment Booked) sends a Webhook to `/booked` with the same header. If that lead is still waiting, they move to the front. If the webhook has `text`, it replaces their waiting message.
+- **Booked calls:** a GoHighLevel workflow (trigger: tag `jean-booked` added, or Appointment Booked) sends a Webhook to `/booked` with the same header. If that lead is still waiting, they move to the front. If they booked before their opt-in message arrived (the opt-in workflow waits 3 minutes), the booking is remembered and they go to the front when the message arrives. If they were already messaged, nothing happens. Leave `text` out of the booking webhook. If it's included, it replaces the lead's waiting message.
 - **ZeroSettle refusals:**
   - Limit reached (429, or a body mentioning a limit): the lead keeps their place until the next day.
   - Rejected API key (401/403): the lead keeps their place and the worker retries hourly.

@@ -32,7 +32,7 @@ export class LeadQueue extends DurableObject {
         contact_id  TEXT,
         name        TEXT,
         text        TEXT,
-        status      TEXT NOT NULL,             -- waiting | sent | failed
+        status      TEXT NOT NULL,             -- waiting | sent | failed | booked (booked, message not in yet)
         priority    INTEGER NOT NULL DEFAULT 0, -- 1 = booked a call
         opted_in_at INTEGER NOT NULL,
         sent_at     INTEGER,
@@ -77,7 +77,10 @@ export class LeadQueue extends DurableObject {
       return { status: "waiting", note: "Already on the waitlist; this message was skipped.", ...this.#position(key) };
     }
 
-    this.#upsertWaiting(key, lead, { text: lead.text, priority: 0, optedInAt: now });
+    // Booked a call before this first message reached us (e.g. during the workflow's wait step)?
+    const priority = existing?.status === "booked" ? 1 : 0;
+    if (priority) console.log(`${lead.to} already booked a call: going to the front of the line`);
+    this.#upsertWaiting(key, lead, { text: lead.text, priority, optedInAt: now });
     const results = await this.#drain();
     return this.#outcomeFor(key, lead, results);
   }
@@ -93,8 +96,20 @@ export class LeadQueue extends DurableObject {
     }
     const text = lead.text.trim() ? lead.text : existing?.text;
     if (!text?.trim()) {
-      console.log(`${lead.to} booked a call but isn't on the waitlist and no text was given: nothing to send`);
-      return { status: "ignored", note: "Not on the waitlist and no text in this webhook." };
+      // Their first message hasn't reached us yet (e.g. the opt-in workflow is still in its
+      // wait step). Remember the booking so they go to the front when it arrives.
+      this.sql.exec(
+        `INSERT INTO leads (phone_key, to_number, contact_id, name, status, priority, opted_in_at)
+         VALUES (?, ?, ?, ?, 'booked', 1, ?)
+         ON CONFLICT (phone_key) DO UPDATE SET priority = 1`,
+        key,
+        lead.to,
+        lead.contactId,
+        lead.name,
+        now,
+      );
+      console.log(`${lead.to} booked a call before their first message came in: they'll go first when it does`);
+      return { status: "booked", note: "Not messaged yet; they go to the front of the line when their message comes in." };
     }
 
     console.log(`${lead.to} booked a call: moving to the front of the waitlist`);
