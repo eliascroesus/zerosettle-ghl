@@ -9,6 +9,7 @@
     "logs": "wrangler tail zerosettle-ghl-relay --format pretty"
   },
   "devDependencies": {
+    "miniflare": "^4.20260730.0",
     "wrangler": "^4.159.0"
   }
 }

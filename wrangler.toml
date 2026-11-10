@@ -14,8 +14,26 @@ enabled = true
 
 # Second creator (trading offer): a separate worker with its own URL, secrets and logs.
 # Deploy with: npx wrangler deploy --env trading
+# This worker also runs the daily waitlist (src/queue.js): ZeroSettle's plan allows
+# DAILY_LIMIT new conversations per day, and extra leads wait their turn.
 [env.trading]
 name = "zerosettle-ghl-relay-trading"
+# Hourly check: starts the new sending day at RESET_HOUR and sends whoever fits.
+triggers = { crons = ["0 * * * *"] }
+
+[env.trading.vars]
+DAILY_LIMIT = "5"
+RESET_TIMEZONE = "America/New_York"
+RESET_HOUR = "12"
+TAG_PREFIX = "jean-imessage-"
+
+[[env.trading.durable_objects.bindings]]
+name = "LEAD_QUEUE"
+class_name = "LeadQueue"
+
+[[env.trading.migrations]]
+tag = "v1"
+new_sqlite_classes = ["LeadQueue"]
 
 [env.trading.observability]
 enabled = true

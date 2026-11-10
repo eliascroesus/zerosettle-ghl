@@ -2,17 +2,27 @@
  * GoHighLevel -> ZeroSettle iMessage relay.
  *
  * GoHighLevel's "Webhook" workflow action POSTs JSON with the contact's
- * standard fields at the top level (phone, first_name, ...) plus a
+ * standard fields at the top level (phone, first_name, contact_id, ...) plus a
  * "customData" object holding the keys set in the action. We take
  * customData.to (falling back to the top-level phone) and customData.text
- * and forward them to ZeroSettle's iMessage send API.
+ * and send them through ZeroSettle's iMessage API.
+ *
+ * Two modes, picked by the worker's config (wrangler.toml):
+ * - Direct (no LEAD_QUEUE binding): every message is sent immediately.
+ * - Waitlist (LEAD_QUEUE bound): new conversations are capped at DAILY_LIMIT
+ *   per day and extra leads wait their turn; see queue.js. POST to /booked
+ *   when a lead books a call to move them to the front.
  *
  * Secrets (set with `wrangler secret put` or in the Cloudflare dashboard):
  *   RELAY_SECRET        - callers must send it in the "x-relay-secret" header
  *   ZEROSETTLE_API_KEY  - sent to ZeroSettle as a Bearer token
+ *   GHL_API_KEY         - (waitlist mode, optional) GoHighLevel token for status tags
  */
 
-const ZEROSETTLE_SEND_URL = "https://portal.zerosettle.io/api/imessage/send";
+import { LeadQueue } from "./queue.js";
+import { json, readLead, safeEqual, sendToZeroSettle, zeroSettleResponse } from "./lib.js";
+
+export { LeadQueue };
 
 export default {
   async fetch(request, env) {
@@ -36,12 +46,12 @@ export default {
     }
     console.log("Incoming payload:", JSON.stringify(payload));
 
-    const customData = payload?.customData ?? {};
-    const to = asString(customData.to).trim() || asString(payload?.phone).trim();
-    const text = asString(customData.text);
+    const lead = readLead(payload);
+    const isBooking = env.LEAD_QUEUE && new URL(request.url).pathname.replace(/\/+$/, "") === "/booked";
 
-    if (!to || !text.trim()) {
-      const missing = [!to && "to", !text.trim() && "text"].filter(Boolean);
+    // A booking webhook may leave out text (the lead's waiting message is used).
+    const missing = [!lead.to && "to", !isBooking && !lead.text.trim() && "text"].filter(Boolean);
+    if (missing.length > 0) {
       console.log(`Rejected request: missing ${missing.join(" and ")}`);
       return json(
         { error: `Missing ${missing.join(" and ")} (expected customData.to or phone, and customData.text)` },
@@ -54,52 +64,26 @@ export default {
       return json({ error: "Relay misconfigured: ZEROSETTLE_API_KEY is not set" }, 500);
     }
 
-    let upstream;
-    try {
-      upstream = await fetch(ZEROSETTLE_SEND_URL, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${env.ZEROSETTLE_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ to, text }),
-      });
-    } catch (err) {
-      console.log("Could not reach ZeroSettle:", String(err));
-      return json({ error: "Could not reach ZeroSettle" }, 502);
+    if (!env.LEAD_QUEUE) {
+      return zeroSettleResponse(await sendToZeroSettle(env, lead.to, lead.text));
     }
 
-    const upstreamBody = await upstream.text();
-    console.log(`ZeroSettle response: ${upstream.status} ${upstreamBody}`);
+    const queue = leadQueue(env);
+    const result = isBooking ? await queue.booked(lead) : await queue.optIn(lead);
+    // When a message actually went to ZeroSettle (sent, or refused for good),
+    // pass ZeroSettle's answer back. Otherwise report the waitlist status.
+    if (result.zeroSettle && result.status !== "waiting") return zeroSettleResponse(result.zeroSettle);
+    const { zeroSettle, ...status } = result;
+    return json(status, result.status === "waiting" ? 202 : 200);
+  },
 
-    return new Response(upstreamBody || null, {
-      status: upstream.status,
-      headers: {
-        "Content-Type": upstream.headers.get("Content-Type") ?? "application/json",
-      },
-    });
+  async scheduled(controller, env) {
+    if (!env.LEAD_QUEUE) return;
+    const summary = await leadQueue(env).tick(controller.scheduledTime);
+    console.log(`Hourly check: sent ${summary.sent}, ${summary.waiting} still waiting`);
   },
 };
 
-function asString(value) {
-  if (value === undefined || value === null) return "";
-  return typeof value === "string" ? value : String(value);
-}
-
-// Constant-time comparison so the secret can't be guessed via response timing.
-function safeEqual(a, b) {
-  const encoder = new TextEncoder();
-  const x = encoder.encode(a);
-  const y = encoder.encode(b);
-  if (x.length !== y.length) return false;
-  let diff = 0;
-  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
-  return diff === 0;
-}
-
-function json(body, status) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
+function leadQueue(env) {
+  return env.LEAD_QUEUE.get(env.LEAD_QUEUE.idFromName("main"));
 }
