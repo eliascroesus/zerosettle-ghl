@@ -1,7 +1,8 @@
-// Waitlist mode (the trading worker). Tests use DAILY_LIMIT 2 to keep them short.
+// Waitlist mode (the trading worker). ZeroSettle is simulated with 2 new contacts a
+// day to keep the tests short (the real Pro plan is 5).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { day, ghl, json, phone, startRelay } from "./helpers.js";
+import { ghl, json, nyTime, phone, startRelay } from "./helpers.js";
 
 async function withWaitlist(opts, fn) {
   const relay = await startRelay({ waitlist: true, ...opts });
@@ -19,19 +20,29 @@ async function optIn(relay, ...ns) {
   return out;
 }
 
-test("sends right away while today's slots last, then puts leads on the waitlist", () =>
+/** A booking webhook as the trading setup sends it: just the contact, no text. */
+function booking(n) {
+  const body = ghl(n);
+  delete body.customData.text;
+  return body;
+}
+
+const zsError = (status, code) => () => json(status, { error: { code, message: code } });
+
+test("sends from the configured line right away, and waitlists leads once ZeroSettle says the line is full", () =>
   withWaitlist({}, async (relay) => {
     const [r1, r2, r3, r4] = await optIn(relay, 1, 2, 3, 4);
 
     assert.equal(r1.status, 200);
     assert.equal(r2.status, 200);
-    assert.deepEqual(await r1.json(), { ok: true }); // ZeroSettle's own answer
+    assert.equal((await r1.json()).status, "message_sent"); // ZeroSettle's own answer
     assert.equal(r3.status, 202);
     assert.deepEqual(await r3.json(), { status: "waiting", position: 1, waiting: 1 });
-    // Newest first: lead 4 jumps ahead of lead 3.
+    // Newest first: lead 4 goes ahead of lead 3.
     assert.deepEqual(await r4.json(), { status: "waiting", position: 1, waiting: 2 });
 
     assert.deepEqual(relay.sentTo(), [phone(1), phone(2)]);
+    assert.ok(relay.zeroSettleCalls().every((c) => c.body.line_id === "ln_test"));
     assert.deepEqual(relay.tagCalls(), [
       "POST contact1 jean-imessage-sent",
       "DELETE contact1 jean-imessage-waiting,jean-imessage-priority",
@@ -42,29 +53,43 @@ test("sends right away while today's slots last, then puts leads on the waitlist
     ]);
   }));
 
-test("at the daily reset, sends the waitlist newest first and keeps the rest waiting", () =>
+test("after ZeroSettle's daily reset, the waitlist goes out newest first and the rest keep waiting", () =>
   withWaitlist({}, async (relay) => {
     await optIn(relay, 1, 2, 3, 4, 5, 6);
     relay.clearCalls();
 
-    // Hourly checks later the same day send nothing: no slots left.
-    await relay.tick(Date.now());
+    // Hourly checks while the line is still full send nothing.
+    await relay.tick();
     assert.deepEqual(relay.sentTo(), []);
 
-    // Next sending day: 2 slots, newest opt-ins first.
-    await relay.tick(day(1));
+    relay.newZeroSettleDay();
+    await relay.tick();
     assert.deepEqual(relay.sentTo(), [phone(6), phone(5)]);
 
-    // Further checks that day don't send more.
-    await relay.tick(day(1, 1));
-    assert.deepEqual(relay.sentTo(), [phone(6), phone(5)]);
-
-    // New opt-ins that day wait too (the waitlist used today's slots).
+    // New opt-ins that day wait too (the waitlist used the day's slots).
     assert.equal((await relay.post(ghl(7))).status, 202);
 
-    // The day after: lead 7 is now the newest, then lead 4.
-    await relay.tick(day(2));
+    relay.newZeroSettleDay();
+    await relay.tick();
     assert.deepEqual(relay.sentTo(), [phone(6), phone(5), phone(7), phone(4)]);
+  }));
+
+test("between 3 AM and noon opt-ins wait for the noon batch, but booked leads go right away", () =>
+  withWaitlist({ bindings: { HOLD_FROM_HOUR: "3", SEND_HOUR: "12" }, newContactLimit: 0 }, async (relay) => {
+    // Line full: everyone waits, whatever time the test runs at.
+    await optIn(relay, 1, 2, 3);
+    await relay.post(booking(2), { path: "/booked" });
+    relay.clearCalls();
+
+    relay.setNewContactLimit(2);
+    relay.newZeroSettleDay();
+
+    await relay.tick(nyTime(1, 10)); // 10 AM: only the booked lead
+    assert.deepEqual(relay.triedTo(), [phone(2)]);
+
+    await relay.tick(nyTime(1, 12)); // noon batch: newest first, until the line is full
+    assert.deepEqual(relay.sentTo(), [phone(2), phone(3)]);
+    assert.deepEqual(relay.triedTo(), [phone(2), phone(3), phone(1)]);
   }));
 
 test("a lead who books a call jumps to the front of the waitlist", () =>
@@ -72,18 +97,20 @@ test("a lead who books a call jumps to the front of the waitlist", () =>
     await optIn(relay, 1, 2, 3, 4, 5);
     relay.clearCalls();
 
-    // Lead 3 (in the middle of the waitlist) books a call, with no text in the booking webhook.
-    const body = ghl(3);
-    delete body.customData.text;
-    const res = await relay.post(body, { path: "/booked" });
+    // Lead 3 (in the middle of the waitlist) books a call; the booking webhook has no text.
+    const res = await relay.post(booking(3), { path: "/booked" });
     assert.equal(res.status, 202);
     assert.deepEqual(await res.json(), { status: "waiting", position: 1, waiting: 3 });
     assert.deepEqual(relay.tagCalls(), ["POST contact3 jean-imessage-waiting,jean-imessage-priority"]);
 
-    await relay.tick(day(1));
+    relay.newZeroSettleDay();
+    await relay.tick();
     // Booked lead first (with their original message), then the newest opt-in.
     assert.deepEqual(
-      relay.zeroSettleCalls().map((c) => c.body),
+      relay
+        .zeroSettleCalls()
+        .filter((c) => c.status === 200)
+        .map((c) => ({ to: c.body.to, text: c.body.text })),
       [
         { to: phone(3), text: "Hi Lead3!" },
         { to: phone(5), text: "Hi Lead5!" },
@@ -97,32 +124,26 @@ test("a booking webhook's text replaces the lead's waiting message", () =>
     await optIn(relay, 1, 2, 3);
     await relay.post(ghl(3, { text: "Saw you booked a call!" }), { path: "/booked/" });
     relay.clearCalls();
-    await relay.tick(day(1));
-    assert.deepEqual(relay.zeroSettleCalls()[0].body, { to: phone(3), text: "Saw you booked a call!" });
+    relay.newZeroSettleDay();
+    await relay.tick();
+    assert.equal(relay.zeroSettleCalls()[0].body.text, "Saw you booked a call!");
   }));
 
-test("a booked lead who never opted in is sent now if a slot is free, otherwise waits at the front", () =>
+test("a booked lead who never opted in is sent now if there's room, otherwise waits at the front", () =>
   withWaitlist({}, async (relay) => {
     const first = await relay.post(ghl(1, { text: "Booking msg" }), { path: "/booked" });
     assert.equal(first.status, 200);
     assert.deepEqual(relay.sentTo(), [phone(1)]);
 
-    await optIn(relay, 2, 3); // 2 uses the last slot, 3 waits
+    await optIn(relay, 2, 3); // 2 takes the last slot, 3 waits
     const booked = await relay.post(ghl(4, { text: "Booking msg" }), { path: "/booked" });
     assert.equal(booked.status, 202);
     assert.equal((await booked.json()).position, 1);
   }));
 
-/** A booking webhook as the trading setup sends it: just the contact, no text. */
-function booking(n) {
-  const body = ghl(n);
-  delete body.customData.text;
-  return body;
-}
-
 test("booking during the opt-in workflow's wait step puts them first once their message comes in", () =>
   withWaitlist({}, async (relay) => {
-    await optIn(relay, 1, 2, 3); // slots full, 3 waiting
+    await optIn(relay, 1, 2, 3); // line full, 3 waiting
 
     // Lead 4 books before their opt-in webhook (still in the 3-minute wait) fires.
     const booked = await relay.post(booking(4), { path: "/booked" });
@@ -139,17 +160,18 @@ test("booking during the opt-in workflow's wait step puts them first once their 
     // A newer, non-booked opt-in still goes behind them.
     assert.equal((await (await relay.post(ghl(5))).json()).position, 2);
 
-    await relay.tick(day(1));
+    relay.newZeroSettleDay();
+    await relay.tick();
     assert.deepEqual(relay.sentTo(), [phone(4), phone(5)]);
   }));
 
-test("booking during the wait step with a free slot sends their one message as normal", () =>
+test("booking during the wait step with room on the line sends their one message as normal", () =>
   withWaitlist({}, async (relay) => {
     await relay.post(booking(1), { path: "/booked" });
     assert.equal(relay.calls.length, 0);
     const res = await relay.post(ghl(1));
     assert.equal(res.status, 200);
-    assert.deepEqual(relay.zeroSettleCalls().map((c) => c.body), [{ to: phone(1), text: "Hi Lead1!" }]);
+    assert.deepEqual(relay.sentTo(), [phone(1)]);
     // Booking again later changes nothing.
     assert.deepEqual(await (await relay.post(booking(1), { path: "/booked" })).json(), { status: "already_sent" });
     assert.equal(relay.zeroSettleCalls().length, 1);
@@ -165,13 +187,13 @@ test("booking a call after already being messaged does nothing", () =>
     assert.equal(relay.calls.length, 0);
   }));
 
-test("follow-ups to someone already messaged go straight through without using a slot", () =>
+test("follow-ups to someone already messaged go straight through, even when the line is full", () =>
   withWaitlist({}, async (relay) => {
-    await optIn(relay, 1, 2); // both slots used
+    await optIn(relay, 1, 2); // line full
     const followUp = await relay.post(ghl(1, { text: "Following up!" }));
     assert.equal(followUp.status, 200);
-    assert.deepEqual(relay.zeroSettleCalls().at(-1).body, { to: phone(1), text: "Following up!" });
-    // Still no slot for a brand-new lead.
+    assert.deepEqual(relay.zeroSettleCalls().at(-1).body, { to: phone(1), text: "Following up!", line_id: "ln_test" });
+    // Still no room for a brand-new lead.
     assert.equal((await relay.post(ghl(3))).status, 202);
   }));
 
@@ -179,7 +201,7 @@ test("phone numbers in different formats count as the same person", () =>
   withWaitlist({}, async (relay) => {
     await relay.post(ghl(1, { to: "+1 (555) 000-0001" }));
     await relay.post(ghl(2, { to: "+15550000001", text: "Again" }));
-    assert.equal(relay.zeroSettleCalls().length, 2); // second one is a follow-up
+    assert.equal(relay.zeroSettleCalls().length, 2); // the second one is a follow-up
     assert.equal((await relay.post(ghl(3))).status, 200); // a slot was still free
   }));
 
@@ -192,38 +214,37 @@ test("more messages for a lead who is still waiting are skipped", () =>
     assert.match((await res.json()).note, /skipped/);
     assert.equal(relay.calls.length, 0);
 
-    await relay.tick(day(1));
-    assert.deepEqual(relay.zeroSettleCalls()[0].body, { to: phone(3), text: "Hi Lead3!" });
+    relay.newZeroSettleDay();
+    await relay.tick();
+    assert.equal(relay.zeroSettleCalls()[0].body.text, "Hi Lead3!");
   }));
 
-test("if ZeroSettle says the daily limit is reached, the lead keeps their place", () =>
+test("ZeroSettle's daily message limit also keeps everyone's place", () =>
   withWaitlist({}, async (relay) => {
-    await optIn(relay, 1); // 1 of 2 slots used
-    relay.setZeroSettle(() => json(429, { error: "Daily new conversation limit reached" }));
-    const res = await relay.post(ghl(2));
+    relay.setZeroSettle(zsError(429, "daily_limit"));
+    const res = await relay.post(ghl(1));
     assert.equal(res.status, 202);
-    assert.equal((await res.json()).status, "waiting");
-
-    // Our counter now treats today as full: no more attempts today.
-    relay.clearCalls();
-    await relay.post(ghl(3));
-    await relay.tick(Date.now());
-    assert.equal(relay.zeroSettleCalls().length, 0);
-
-    relay.setZeroSettle(() => json(200, { ok: true }));
-    await relay.tick(day(1));
-    assert.deepEqual(relay.sentTo(), [phone(3), phone(2)]);
+    relay.setZeroSettle(null);
+    await relay.tick();
+    assert.deepEqual(relay.sentTo(), [phone(1)]);
   }));
 
-test("a number ZeroSettle rejects is marked failed and the next lead gets the slot", () =>
+test("leads ZeroSettle can't message (bad number, opted out) are marked failed and the next lead goes", () =>
   withWaitlist({}, async (relay) => {
-    await optIn(relay, 1, 2, 3, 4);
+    await optIn(relay, 1, 2, 3, 4, 5);
     relay.clearCalls();
+    relay.newZeroSettleDay();
     relay.setZeroSettle((body) =>
-      body.to === phone(4) ? json(400, { error: "invalid phone number" }) : json(200, { ok: true }),
+      body.to === phone(5)
+        ? json(422, { error: { code: "invalid_request" } })
+        : body.to === phone(4)
+          ? json(403, { error: { code: "recipient_opted_out" } })
+          : json(200, { ok: true }),
     );
-    await relay.tick(day(1));
-    assert.deepEqual(relay.sentTo(), [phone(4), phone(3)]);
+    await relay.tick();
+    assert.deepEqual(relay.triedTo(), [phone(5), phone(4), phone(3)]);
+    assert.deepEqual(relay.sentTo(), [phone(3)]);
+    assert.ok(relay.tagCalls().includes("POST contact5 jean-imessage-failed"));
     assert.ok(relay.tagCalls().includes("POST contact4 jean-imessage-failed"));
     assert.ok(relay.tagCalls().includes("POST contact3 jean-imessage-sent"));
   }));
@@ -232,14 +253,14 @@ test("a temporary ZeroSettle outage keeps everyone waiting and retries hourly", 
   withWaitlist({}, async (relay) => {
     await optIn(relay, 1, 2, 3);
     relay.clearCalls();
-    relay.setZeroSettle(() => json(503, { error: "unavailable" }));
+    relay.newZeroSettleDay();
+    relay.setZeroSettle(zsError(503, "phone_offline"));
+    for (let h = 0; h < 4; h++) await relay.tick();
+    assert.deepEqual(relay.triedTo(), [phone(3), phone(3), phone(3), phone(3)]); // one try per hour
 
-    for (let h = 0; h < 4; h++) await relay.tick(day(1, h));
-    assert.deepEqual(relay.sentTo(), [phone(3), phone(3), phone(3), phone(3)]); // one try per hour
-
-    relay.setZeroSettle(() => json(200, { ok: true }));
-    await relay.tick(day(1, 4));
-    assert.equal(relay.sentTo().at(-1), phone(3));
+    relay.setZeroSettle(null);
+    await relay.tick();
+    assert.deepEqual(relay.sentTo(), [phone(3)]);
     assert.ok(relay.tagCalls().includes("POST contact3 jean-imessage-sent"));
   }));
 
@@ -247,36 +268,41 @@ test("a lead whose sends keep failing temporarily is marked failed after 5 tries
   withWaitlist({}, async (relay) => {
     await optIn(relay, 1, 2, 3);
     relay.clearCalls();
-    relay.setZeroSettle(() => json(503, { error: "unavailable" }));
-    for (let h = 0; h < 5; h++) await relay.tick(day(1, h));
+    relay.setZeroSettle(zsError(503, "phone_offline"));
+    for (let h = 0; h < 5; h++) await relay.tick();
     assert.ok(relay.tagCalls().includes("POST contact3 jean-imessage-failed"));
   }));
 
-test("a refused ZeroSettle API key doesn't use up anyone's tries", () =>
+test("setup problems (bad API key, wrong line id) never cost anyone their place", () =>
   withWaitlist({}, async (relay) => {
     await optIn(relay, 1, 2, 3);
     relay.clearCalls();
-    relay.setZeroSettle(() => json(401, { error: "bad key" }));
-    for (let h = 0; h < 8; h++) await relay.tick(day(1, h));
+    relay.newZeroSettleDay();
+    for (const answer of [json(401, { error: "bad key" }), json(404, { error: { code: "unknown_line" } })]) {
+      relay.setZeroSettle(() => answer.clone());
+      for (let h = 0; h < 6; h++) await relay.tick();
+    }
     assert.ok(!relay.tagCalls().some((t) => t.includes("failed")));
 
-    relay.setZeroSettle(() => json(200, { ok: true }));
-    await relay.tick(day(1, 9));
-    assert.equal(relay.sentTo().at(-1), phone(3));
+    relay.setZeroSettle(null);
+    await relay.tick();
+    assert.deepEqual(relay.sentTo(), [phone(3)]);
   }));
 
-test("many opt-ins at the same moment never go over the daily limit", () =>
+test("many opt-ins at the same moment never get anyone sent twice", () =>
   withWaitlist({}, async (relay) => {
     const responses = await Promise.all([1, 2, 3, 4, 5, 6].map((n) => relay.post(ghl(n))));
     const statuses = responses.map((r) => r.status).sort();
     assert.deepEqual(statuses, [200, 200, 202, 202, 202, 202]);
-    assert.equal(relay.zeroSettleCalls().length, 2);
+    assert.equal(relay.sentTo().length, 2);
+    assert.equal(new Set(relay.sentTo()).size, 2);
   }));
 
 test("without GHL_API_KEY the waitlist still works, just without tags", () =>
   withWaitlist({ bindings: { GHL_API_KEY: "" } }, async (relay) => {
     await optIn(relay, 1, 2, 3);
-    await relay.tick(day(1));
+    relay.newZeroSettleDay();
+    await relay.tick();
     assert.deepEqual(relay.sentTo(), [phone(1), phone(2), phone(3)]);
     assert.deepEqual(relay.tagCalls(), []);
   }));

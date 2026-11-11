@@ -21,8 +21,16 @@ export function phoneKey(to) {
   return to.replace(/\D/g, "") || to;
 }
 
-/** POST one message to ZeroSettle. Never throws; a network failure comes back as status 0. */
+/**
+ * POST one message to ZeroSettle. Never throws; a network failure comes back as status 0.
+ *
+ * With ZEROSETTLE_LINE_ID set, the message goes out from exactly that line. Without it,
+ * ZeroSettle picks a line itself on accounts with several numbers, so one creator's leads
+ * can end up on another creator's line.
+ */
 export async function sendToZeroSettle(env, to, text) {
+  const message = { to, text };
+  if (env.ZEROSETTLE_LINE_ID) message.line_id = env.ZEROSETTLE_LINE_ID;
   try {
     const res = await fetch(ZEROSETTLE_SEND_URL, {
       method: "POST",
@@ -30,7 +38,7 @@ export async function sendToZeroSettle(env, to, text) {
         Authorization: `Bearer ${env.ZEROSETTLE_API_KEY}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ to, text }),
+      body: JSON.stringify(message),
       signal: AbortSignal.timeout(15000),
     });
     const body = await res.text();
@@ -38,12 +46,22 @@ export async function sendToZeroSettle(env, to, text) {
     return {
       ok: res.ok,
       status: res.status,
+      code: errorCode(body),
       body,
       contentType: res.headers.get("Content-Type") ?? "application/json",
     };
   } catch (err) {
     console.log("Could not reach ZeroSettle:", String(err));
-    return { ok: false, status: 0, body: "", contentType: "application/json" };
+    return { ok: false, status: 0, code: "", body: "", contentType: "application/json" };
+  }
+}
+
+/** ZeroSettle errors look like {"error": {"code": "new_contact_limit", ...}}. */
+function errorCode(body) {
+  try {
+    return JSON.parse(body)?.error?.code ?? "";
+  } catch {
+    return "";
   }
 }
 

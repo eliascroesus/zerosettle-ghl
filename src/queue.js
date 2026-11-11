@@ -1,23 +1,27 @@
 import { DurableObject } from "cloudflare:workers";
 import { updateTags } from "./ghl.js";
-import { periodKey } from "./period.js";
 import { phoneKey, sendToZeroSettle } from "./lib.js";
+import { localHour } from "./time.js";
 
 /**
- * Daily waitlist for a ZeroSettle line that can only start a few new
- * conversations per day (DAILY_LIMIT).
+ * Waitlist for a ZeroSettle line that can only start a few new conversations a
+ * day (5 per number on the Pro plan, reset at 3 AM Eastern). ZeroSettle enforces
+ * that limit itself: a send to a new contact on a full line is refused with
+ * 429 new_contact_limit and nothing is sent. The waitlist makes sure nobody is
+ * lost when that happens, and decides who gets the slots:
  *
- * - The first message to a new number uses one of the day's slots. If none is
- *   left, the lead waits. Messages to a number that was already messaged go
- *   straight through and don't use a slot.
- * - Waiting order: people who booked a call first, then newest opt-ins first.
- * - Every hour a cron tick calls tick(). At RESET_HOUR (RESET_TIMEZONE) a new
- *   sending day starts, the counter goes back to 0 and the waitlist is sent first.
- * - If ZeroSettle refuses a send (e.g. its own limit), the lead keeps its place.
+ * - The first message to a new number needs a slot. If ZeroSettle says the line
+ *   is full, the lead waits. Messages to someone already messaged go straight
+ *   through (ongoing conversations don't count toward the limit).
+ * - Order: people who booked a call first, then newest opt-ins first.
+ * - From HOLD_FROM_HOUR (3, when ZeroSettle's day resets) until SEND_HOUR (12),
+ *   in TIMEZONE, opt-ins wait so the new day's slots go out as one batch at
+ *   SEND_HOUR in waitlist order. People who booked a call don't wait for it.
+ * - An hourly cron tick sends whoever fits; it is what sends the SEND_HOUR batch.
  * - Each lead's status is mirrored to GoHighLevel tags (see ghl.js).
  *
  * One instance holds all state in SQLite, and every operation runs one at a
- * time (see #serialize) so two webhooks can never both take the last slot.
+ * time (see #serialize), so two webhooks never race for the same lead.
  */
 export class LeadQueue extends DurableObject {
   #lock = Promise.resolve();
@@ -41,7 +45,6 @@ export class LeadQueue extends DurableObject {
       );
       CREATE INDEX IF NOT EXISTS leads_by_queue_order
         ON leads (status, priority DESC, opted_in_at DESC);
-      CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     `);
   }
 
@@ -55,7 +58,7 @@ export class LeadQueue extends DurableObject {
     return this.#serialize(() => this.#booked(lead, Date.now()));
   }
 
-  /** Hourly cron: start a new sending day when it's time, then send whoever fits. */
+  /** Hourly cron: send whoever fits now. */
   tick(now) {
     return this.#serialize(() => this.#tick(now));
   }
@@ -63,12 +66,11 @@ export class LeadQueue extends DurableObject {
   // --- operations -----------------------------------------------------------
 
   async #optIn(lead, now) {
-    this.#rollPeriod(now);
     const key = phoneKey(lead.to);
     const existing = this.#lead(key);
 
     if (existing?.status === "sent") {
-      console.log(`${lead.to} was already messaged: sending this follow-up now (no daily slot used)`);
+      console.log(`${lead.to} was already messaged: sending this follow-up now (doesn't count as a new contact)`);
       const zeroSettle = await sendToZeroSettle(this.env, lead.to, lead.text);
       return { status: zeroSettle.ok ? "sent" : "failed", followUp: true, zeroSettle };
     }
@@ -81,12 +83,11 @@ export class LeadQueue extends DurableObject {
     const priority = existing?.status === "booked" ? 1 : 0;
     if (priority) console.log(`${lead.to} already booked a call: going to the front of the line`);
     this.#upsertWaiting(key, lead, { text: lead.text, priority, optedInAt: now });
-    const results = await this.#drain();
-    return this.#outcomeFor(key, lead, results);
+    const drained = await this.#drain(now);
+    return this.#outcomeFor(key, lead, drained);
   }
 
   async #booked(lead, now) {
-    this.#rollPeriod(now);
     const key = phoneKey(lead.to);
     const existing = this.#lead(key);
 
@@ -114,35 +115,31 @@ export class LeadQueue extends DurableObject {
 
     console.log(`${lead.to} booked a call: moving to the front of the waitlist`);
     this.#upsertWaiting(key, lead, { text, priority: 1, optedInAt: existing?.opted_in_at ?? now });
-    const results = await this.#drain();
-    return this.#outcomeFor(key, lead, results);
+    const drained = await this.#drain(now);
+    return this.#outcomeFor(key, lead, drained);
   }
 
   async #tick(now) {
-    const newDay = this.#rollPeriod(now);
-    const waiting = this.#waitingCount();
-    if (newDay) {
-      console.log(`New sending day ${this.#meta("period")}: ${this.#limit()} slots, ${waiting} on the waitlist`);
-    }
-    if (waiting === 0) return { sent: 0, waiting: 0 };
-    const results = await this.#drain();
+    if (this.#waitingCount() === 0) return { sent: 0, waiting: 0 };
+    const { results } = await this.#drain(now);
     const sent = [...results.values()].filter((r) => r.status === "sent").length;
     return { sent, waiting: this.#waitingCount() };
   }
 
   /**
-   * Send to waiting leads in priority order while today's slots last.
-   * Returns a Map of phone_key -> { status, zeroSettle } for every lead tried.
+   * Send to waiting leads in queue order until ZeroSettle says the line is full,
+   * or nobody sendable is left. During the morning hold only booked leads go.
+   * Returns { results: Map(phone_key -> { status, zeroSettle }), held, stopped }.
    */
-  async #drain() {
+  async #drain(now) {
     const results = new Map();
-    const limit = this.#limit();
-    let used = this.#used();
+    const held = this.#inHold(now);
+    let stopped = null;
 
-    while (used < limit) {
+    while (true) {
       const lead = this.sql
         .exec(
-          `SELECT * FROM leads WHERE status = 'waiting'
+          `SELECT * FROM leads WHERE status = 'waiting' ${held ? "AND priority > 0" : ""}
            ORDER BY priority DESC, opted_in_at DESC LIMIT 1`,
         )
         .toArray()[0];
@@ -152,15 +149,13 @@ export class LeadQueue extends DurableObject {
       const outcome = classify(zeroSettle);
 
       if (outcome === "sent") {
-        used += 1;
-        this.#setMeta("used", used);
         this.sql.exec(
           `UPDATE leads SET status = 'sent', sent_at = ?, attempts = attempts + 1, last_error = NULL
            WHERE phone_key = ?`,
           Date.now(),
           lead.phone_key,
         );
-        console.log(`Sent first message to ${lead.to_number}${lead.priority ? " (booked a call)" : ""}: ${used}/${limit} slots used`);
+        console.log(`Sent first message to ${lead.to_number}${lead.priority ? " (booked a call)" : ""}`);
         await updateTags(this.env, lead.contact_id, { add: ["sent"], remove: ["waiting", "priority"] });
         results.set(lead.phone_key, { status: "sent", zeroSettle });
         continue;
@@ -168,20 +163,17 @@ export class LeadQueue extends DurableObject {
 
       const error = `${zeroSettle.status} ${zeroSettle.body}`.slice(0, 500);
 
-      if (outcome === "limit") {
-        // ZeroSettle says the line is out of new conversations: wait for the next day.
-        this.#setMeta("used", limit);
+      if (outcome === "limit" || outcome === "config") {
+        // The line can't take a new contact right now; not this lead's fault, so nobody
+        // loses their place. A full line frees up at ZeroSettle's 3 AM Eastern reset.
         this.sql.exec(`UPDATE leads SET last_error = ? WHERE phone_key = ?`, error, lead.phone_key);
-        console.log(`ZeroSettle daily limit reached: ${lead.to_number} keeps their place for the next reset`);
+        console.log(
+          outcome === "limit"
+            ? `Line is out of new contacts for today (${zeroSettle.code || zeroSettle.status}): the waitlist goes out after ZeroSettle's 3 AM Eastern reset`
+            : `ZeroSettle refused the send for a setup reason (${zeroSettle.code || zeroSettle.status}): check ZEROSETTLE_API_KEY / ZEROSETTLE_LINE_ID. Retrying next hour.`,
+        );
         results.set(lead.phone_key, { status: "waiting", zeroSettle });
-        break;
-      }
-
-      if (outcome === "config") {
-        // Our ZeroSettle key was refused. Not the lead's fault; nobody loses their place.
-        this.sql.exec(`UPDATE leads SET last_error = ? WHERE phone_key = ?`, error, lead.phone_key);
-        console.log(`ZeroSettle refused the API key (${zeroSettle.status}): check ZEROSETTLE_API_KEY. Will retry next hour.`);
-        results.set(lead.phone_key, { status: "waiting", zeroSettle });
+        stopped = outcome;
         break;
       }
 
@@ -199,7 +191,7 @@ export class LeadQueue extends DurableObject {
         continue;
       }
 
-      // Temporary problem (ZeroSettle down, timeout): keep their place, retry next hour.
+      // Temporary problem (ZeroSettle or the phone briefly unavailable): keep their place.
       this.sql.exec(
         `UPDATE leads SET attempts = ?, last_error = ? WHERE phone_key = ?`,
         attempts,
@@ -208,13 +200,14 @@ export class LeadQueue extends DurableObject {
       );
       console.log(`Temporary ZeroSettle problem (${error}): ${lead.to_number} keeps their place, retrying next hour`);
       results.set(lead.phone_key, { status: "waiting", zeroSettle });
+      stopped = "retry";
       break;
     }
-    return results;
+    return { results, held, stopped };
   }
 
   /** What to tell GoHighLevel about this webhook's lead after a drain. */
-  async #outcomeFor(key, lead, results) {
+  async #outcomeFor(key, lead, { results, held, stopped }) {
     const result = results.get(key);
     if (result && result.status !== "waiting") return result;
 
@@ -223,10 +216,13 @@ export class LeadQueue extends DurableObject {
       add: row.priority ? ["waiting", "priority"] : ["waiting"],
     });
     const position = this.#position(key);
-    console.log(
-      `${lead.to} is on the waitlist: #${position.position} of ${position.waiting}` +
-        ` (${this.#used()}/${this.#limit()} slots used today)`,
-    );
+    const why =
+      stopped === "limit"
+        ? "the line is out of new contacts for today"
+        : held && !row.priority
+          ? `waiting for the ${this.env.SEND_HOUR ?? 12}:00 batch`
+          : "waiting for the next try";
+    console.log(`${lead.to} is on the waitlist: #${position.position} of ${position.waiting} (${why})`);
     return { status: "waiting", ...position };
   }
 
@@ -256,14 +252,12 @@ export class LeadQueue extends DurableObject {
     );
   }
 
-  /** Start a new sending day if one has begun. Only ever moves forward. */
-  #rollPeriod(now) {
-    const period = periodKey(now, this.env.RESET_TIMEZONE ?? "America/New_York", Number(this.env.RESET_HOUR ?? 12));
-    const current = this.#meta("period");
-    if (current && period <= current) return false;
-    this.#setMeta("period", period);
-    this.#setMeta("used", 0);
-    return true;
+  /** True between HOLD_FROM_HOUR and SEND_HOUR (local time): opt-ins wait for the batch. */
+  #inHold(now) {
+    const from = Number(this.env.HOLD_FROM_HOUR ?? 3);
+    const until = Number(this.env.SEND_HOUR ?? 12);
+    const hour = localHour(now, this.env.TIMEZONE ?? "America/New_York");
+    return from <= until ? from <= hour && hour < until : hour >= from || hour < until;
   }
 
   #position(key) {
@@ -288,27 +282,6 @@ export class LeadQueue extends DurableObject {
     return this.sql.exec(`SELECT COUNT(*) AS n FROM leads WHERE status = 'waiting'`).one().n;
   }
 
-  #limit() {
-    return Number(this.env.DAILY_LIMIT ?? 5);
-  }
-
-  #used() {
-    return Number(this.#meta("used") ?? 0);
-  }
-
-  #meta(key) {
-    return this.sql.exec(`SELECT value FROM meta WHERE key = ?`, key).toArray()[0]?.value;
-  }
-
-  #setMeta(key, value) {
-    this.sql.exec(
-      `INSERT INTO meta (key, value) VALUES (?, ?)
-       ON CONFLICT (key) DO UPDATE SET value = excluded.value`,
-      key,
-      String(value),
-    );
-  }
-
   /** Run operations strictly one after another, even across awaits on fetch(). */
   #serialize(fn) {
     const run = this.#lock.then(fn);
@@ -321,11 +294,23 @@ export class LeadQueue extends DurableObject {
 // (about this many hours), so one bad number can't block the whole waitlist.
 const MAX_ATTEMPTS = 5;
 
-/** sent | limit | config | failed | retry */
-function classify({ ok, status, body }) {
+// ZeroSettle error codes (portal.zerosettle.io/docs.md, "Errors").
+const LINE_FULL = new Set(["new_contact_limit", "daily_limit"]);
+const SETUP_PROBLEM = new Set(["unauthorized", "payment_required", "forbidden", "unknown_line", "line_draining", "managed_by_zerosettle"]);
+const TEMPORARY = new Set(["line_busy", "phone_offline", "phone_timeout", "unavailable", "rate_limited"]);
+
+/**
+ * sent | limit (line full today) | config (our setup; retry hourly) |
+ * failed (this lead can't be messaged: opted out, bad number...) | retry (temporary)
+ */
+function classify({ ok, status, code }) {
   if (ok) return "sent";
-  if (status === 429 || /limit|quota|exceed|too many/i.test(body)) return "limit";
-  if (status === 401 || status === 403) return "config";
-  if (status === 400 || status === 404 || status === 422) return "failed";
+  if (LINE_FULL.has(code)) return "limit";
+  if (SETUP_PROBLEM.has(code)) return "config";
+  if (TEMPORARY.has(code)) return "retry";
+  if (code === "send_failed") return "failed";
+  if (status === 429) return "limit";
+  if (status === 401 || status === 402) return "config";
+  if (status >= 400 && status < 500) return "failed";
   return "retry";
 }

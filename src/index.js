@@ -9,9 +9,11 @@
  *
  * Two modes, picked by the worker's config (wrangler.toml):
  * - Direct (no LEAD_QUEUE binding): every message is sent immediately.
- * - Waitlist (LEAD_QUEUE bound): new conversations are capped at DAILY_LIMIT
- *   per day and extra leads wait their turn; see queue.js. POST to /booked
- *   when a lead books a call to move them to the front.
+ * - Waitlist (LEAD_QUEUE bound): when ZeroSettle's daily new-contact limit is
+ *   reached, leads wait their turn instead of being lost; see queue.js. POST to
+ *   /booked when a lead books a call to move them to the front.
+ *
+ * ZEROSETTLE_LINE_ID (a var) pins the sending line; see sendToZeroSettle in lib.js.
  *
  * Secrets (set with `wrangler secret put` or in the Cloudflare dashboard):
  *   RELAY_SECRET        - callers must send it in the "x-relay-secret" header

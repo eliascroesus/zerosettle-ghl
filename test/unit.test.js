@@ -1,22 +1,17 @@
 // Plain Node tests for the pieces that don't need the Workers runtime.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { periodKey } from "../src/period.js";
+import { localHour } from "../src/time.js";
 import { phoneKey, readLead, safeEqual, sendToZeroSettle, zeroSettleResponse } from "../src/lib.js";
 
 const NY = "America/New_York";
 
-test("a sending day starts at noon New York time, in summer (EDT) and winter (EST)", () => {
-  assert.equal(periodKey(Date.parse("2026-07-15T15:59:00Z"), NY, 12), "2026-07-14"); // 11:59am EDT
-  assert.equal(periodKey(Date.parse("2026-07-15T16:00:00Z"), NY, 12), "2026-07-15"); // 12:00pm EDT
-  assert.equal(periodKey(Date.parse("2026-12-15T16:59:00Z"), NY, 12), "2026-12-14"); // 11:59am EST
-  assert.equal(periodKey(Date.parse("2026-12-15T17:00:00Z"), NY, 12), "2026-12-15"); // 12:00pm EST
-});
-
-test("sending days roll over month and year boundaries", () => {
-  assert.equal(periodKey(Date.parse("2026-03-01T05:00:00Z"), NY, 12), "2026-02-28"); // midnight Mar 1
-  assert.equal(periodKey(Date.parse("2027-01-01T16:00:00Z"), NY, 12), "2026-12-31"); // 11am Jan 1
-  assert.equal(periodKey(Date.parse("2027-01-01T05:00:00Z"), NY, 0), "2027-01-01"); // midnight reset
+test("localHour gives New York time in summer (EDT) and winter (EST)", () => {
+  assert.equal(localHour(Date.parse("2026-07-15T15:59:00Z"), NY), 11);
+  assert.equal(localHour(Date.parse("2026-07-15T16:00:00Z"), NY), 12);
+  assert.equal(localHour(Date.parse("2026-12-15T16:59:00Z"), NY), 11);
+  assert.equal(localHour(Date.parse("2026-12-15T17:00:00Z"), NY), 12);
+  assert.equal(localHour(Date.parse("2026-12-15T05:30:00Z"), NY), 0); // midnight is 0, not 24
 });
 
 test("readLead takes customData.to, falls back to phone, and picks up contact id and name", () => {

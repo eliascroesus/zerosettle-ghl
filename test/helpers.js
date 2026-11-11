@@ -1,37 +1,52 @@
 import { Miniflare } from "miniflare";
-import { periodKey } from "../src/period.js";
+import { localHour } from "../src/time.js";
 
 export const SECRET = "s3cret-value";
 export const HOUR = 60 * 60 * 1000;
 
-/**
- * A moment on the k-th sending day after today (k = 1 is the next noon-New-York
- * reset), `hours` after that reset. Anchoring to real resets keeps the tests
- * independent of the time of day they run at.
- */
-export function day(k, hours = 0) {
-  let current = periodKey(Date.now(), "America/New_York", 12);
-  let t = Math.ceil(Date.now() / HOUR) * HOUR;
-  for (let seen = 0; ; t += HOUR) {
-    const key = periodKey(t, "America/New_York", 12);
-    if (key !== current && ++seen === k) return t + 60_000 + hours * HOUR;
-    current = key;
+/** `hour`:01 New York time, `daysFromToday` days from today (New York date). */
+export function nyTime(daysFromToday, hour) {
+  const today = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+  const [y, m, d] = today.split("-").map(Number);
+  for (const utcOffset of [5, 4]) {
+    const t = Date.UTC(y, m - 1, d + daysFromToday, hour + utcOffset, 1);
+    if (localHour(t, "America/New_York") === hour) return t;
   }
+  throw new Error(`no ${hour}:01 in New York on that day`);
 }
 
 /**
  * Run the worker in the real Workers runtime (workerd via Miniflare).
- * Every outgoing request (ZeroSettle, GoHighLevel) is recorded in `calls`
- * and answered by `zeroSettle(body)` / a 200 for GoHighLevel.
+ * Every outgoing request (ZeroSettle, GoHighLevel) is recorded in `calls`.
+ *
+ * ZeroSettle is simulated like the real API: each new contact uses one of the
+ * line's `newContactLimit` daily slots, and past it a send to a new contact is
+ * refused with 429 new_contact_limit (nothing sent). People already messaged
+ * don't count. `newZeroSettleDay()` is the 3 AM Eastern reset.
  */
-export async function startRelay({ waitlist = false, bindings = {}, zeroSettle } = {}) {
+export async function startRelay({ waitlist = false, bindings = {}, zeroSettle, newContactLimit } = {}) {
   const calls = [];
   const logs = [];
-  const state = {
-    zeroSettle:
-      zeroSettle ??
-      (() => new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } })),
+  const line = { limit: newContactLimit ?? (waitlist ? 2 : Infinity), used: 0, known: new Set() };
+  const simulatedZeroSettle = (body) => {
+    const key = body.to.replace(/\D/g, "");
+    if (!line.known.has(key)) {
+      if (line.used >= line.limit) {
+        return json(429, {
+          error: { code: "new_contact_limit", message: "Pro includes 5 new contacts a day per number.", retry_after_s: 3600 },
+        });
+      }
+      line.used += 1;
+      line.known.add(key);
+    }
+    return json(200, { ok: true, status: "message_sent", record: { handle: body.to, line_id: body.line_id ?? null } });
   };
+  const state = { zeroSettle: zeroSettle ?? simulatedZeroSettle };
 
   const mf = new Miniflare({
     modules: true,
@@ -44,9 +59,11 @@ export async function startRelay({ waitlist = false, bindings = {}, zeroSettle }
       ZEROSETTLE_API_KEY: "zs_test_key",
       ...(waitlist && {
         GHL_API_KEY: "ghl_test_key",
-        DAILY_LIMIT: "2",
-        RESET_TIMEZONE: "America/New_York",
-        RESET_HOUR: "12",
+        ZEROSETTLE_LINE_ID: "ln_test",
+        TIMEZONE: "America/New_York",
+        // No morning hold by default, so tests don't depend on the time they run at.
+        HOLD_FROM_HOUR: "0",
+        SEND_HOUR: "0",
         TAG_PREFIX: "jean-imessage-",
       }),
       ...bindings,
@@ -60,8 +77,12 @@ export async function startRelay({ waitlist = false, bindings = {}, zeroSettle }
         body: body ? JSON.parse(body) : undefined,
       };
       calls.push(call);
-      if (call.url.startsWith("https://portal.zerosettle.io/")) return state.zeroSettle(call.body);
-      return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } });
+      if (!call.url.startsWith("https://portal.zerosettle.io/")) {
+        return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      const response = await state.zeroSettle(call.body);
+      call.status = response.status;
+      return response;
     },
     handleRuntimeStdio(stdout) {
       stdout.on("data", (chunk) => logs.push(String(chunk)));
@@ -71,12 +92,26 @@ export async function startRelay({ waitlist = false, bindings = {}, zeroSettle }
   const relay = {
     calls,
     logs,
-    /** Swap ZeroSettle's mock answer mid-test. */
+    /** Swap ZeroSettle's answer mid-test; null goes back to the simulated API. */
     setZeroSettle(fn) {
-      state.zeroSettle = fn;
+      state.zeroSettle = fn ?? simulatedZeroSettle;
+    },
+    /** ZeroSettle's 3 AM Eastern reset of the new-contact count. */
+    newZeroSettleDay() {
+      line.used = 0;
+    },
+    setNewContactLimit(n) {
+      line.limit = n;
     },
     zeroSettleCalls: () => calls.filter((c) => c.url.startsWith("https://portal.zerosettle.io/")),
-    sentTo: () => relay.zeroSettleCalls().map((c) => c.body.to),
+    /** Everyone ZeroSettle was asked to message, accepted or not. */
+    triedTo: () => relay.zeroSettleCalls().map((c) => c.body.to),
+    /** Everyone ZeroSettle actually messaged. */
+    sentTo: () =>
+      relay
+        .zeroSettleCalls()
+        .filter((c) => c.status < 300)
+        .map((c) => c.body.to),
     tagCalls: () =>
       calls
         .filter((c) => c.url.startsWith("https://services.leadconnectorhq.com/"))
@@ -91,7 +126,7 @@ export async function startRelay({ waitlist = false, bindings = {}, zeroSettle }
     },
     fetch: (url, init) => mf.dispatchFetch(url, init),
     /** Fire the hourly cron as if it were `time` (ms since epoch). */
-    async tick(time) {
+    async tick(time = Date.now()) {
       const worker = await mf.getWorker();
       return worker.scheduled({ scheduledTime: new Date(time), cron: "0 * * * *" });
     },

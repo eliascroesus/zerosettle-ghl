@@ -31,6 +31,16 @@ test("forwards customData.to and customData.text to ZeroSettle and logs both sid
     assert.match(logs, /Incoming payload: .*Hi Jane!/);
   }));
 
+test("sends from the line in ZEROSETTLE_LINE_ID when it is set", () =>
+  withRelay({ bindings: { ZEROSETTLE_LINE_ID: "ln_5e26a0ae50f4ea21" } }, async (relay) => {
+    assert.equal((await relay.post(ghl(1))).status, 200);
+    assert.deepEqual(relay.zeroSettleCalls()[0].body, {
+      to: "+15550000001",
+      text: "Hi Lead1!",
+      line_id: "ln_5e26a0ae50f4ea21",
+    });
+  }));
+
 test("falls back to the top-level phone when customData.to is missing or blank", () =>
   withRelay({}, async (relay) => {
     for (const customData of [{ text: "Hello" }, { to: "  ", text: "Hello" }]) {
