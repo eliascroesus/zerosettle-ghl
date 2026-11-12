@@ -13,7 +13,47 @@ export function readLead(payload) {
     text: asString(customData.text),
     contactId: asString(payload?.contact_id).trim(),
     name: asString(payload?.full_name).trim() || asString(payload?.first_name).trim(),
+    tags: readTags(payload?.tags),
   };
+}
+
+/** GoHighLevel sends the contact's tags as "a,b,c" or ["a","b"]. Lowercased. */
+function readTags(tags) {
+  const list = Array.isArray(tags) ? tags : asString(tags).split(",");
+  return list.map((t) => asString(t).trim().toLowerCase()).filter(Boolean);
+}
+
+/** Best-effort E.164 ("+14125226996") for looking a number up in ZeroSettle. */
+export function e164(to) {
+  const digits = to.replace(/\D/g, "");
+  if (to.trim().startsWith("+")) return `+${digits}`;
+  if (digits.length === 10) return `+1${digits}`;
+  return `+${digits}`;
+}
+
+/**
+ * Has this line already sent this person a message? Asks ZeroSettle, so it also knows
+ * about messages sent before the waitlist existed or by hand from the console.
+ * Returns true/false, or null when ZeroSettle couldn't be asked.
+ */
+export async function alreadyMessaged(env, to) {
+  const query = new URLSearchParams({ after_id: "0", limit: "200", handle: e164(to) });
+  if (env.ZEROSETTLE_LINE_ID) query.set("line_id", env.ZEROSETTLE_LINE_ID);
+  try {
+    const res = await fetch(`https://portal.zerosettle.io/api/imessage/messages?${query}`, {
+      headers: { Authorization: `Bearer ${env.ZEROSETTLE_API_KEY}` },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) {
+      console.log(`Couldn't check ZeroSettle history for ${to}: ${res.status}`);
+      return null;
+    }
+    const { messages = [] } = await res.json();
+    return messages.some((m) => m.direction === "out" && m.status !== "failed");
+  } catch (err) {
+    console.log(`Couldn't check ZeroSettle history for ${to}:`, String(err));
+    return null;
+  }
 }
 
 /** Digits only, so "+1 (555) 123-4567" and "+15551234567" count as the same person. */

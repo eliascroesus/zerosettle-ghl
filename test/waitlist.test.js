@@ -101,7 +101,7 @@ test("a lead who books a call jumps to the front of the waitlist", () =>
     const res = await relay.post(booking(3), { path: "/booked" });
     assert.equal(res.status, 202);
     assert.deepEqual(await res.json(), { status: "waiting", position: 1, waiting: 3 });
-    assert.deepEqual(relay.tagCalls(), ["POST contact3 jean-imessage-waiting,jean-imessage-priority"]);
+    assert.ok(relay.tagCalls().includes("POST contact3 jean-imessage-waiting,jean-imessage-priority"));
 
     relay.newZeroSettleDay();
     await relay.tick();
@@ -148,7 +148,7 @@ test("booking during the opt-in workflow's wait step puts them first once their 
     // Lead 4 books before their opt-in webhook (still in the 3-minute wait) fires.
     const booked = await relay.post(booking(4), { path: "/booked" });
     assert.equal(booked.status, 200);
-    assert.equal((await booked.json()).status, "booked");
+    assert.equal((await booked.json()).status, "noted");
     relay.clearCalls();
 
     // Their opt-in webhook arrives: they go to the front, tagged as priority.
@@ -322,4 +322,90 @@ test("the secret is still required in waitlist mode, including for /booked", () 
     assert.equal((await relay.post(ghl(1), { headers: {} })).status, 401);
     assert.equal((await relay.post(ghl(1), { path: "/booked", headers: { "x-relay-secret": "nope" } })).status, 401);
     assert.equal(relay.calls.length, 0);
+  }));
+
+// --- priority from tags, status updates, and never double-texting -----------
+
+test("applied leads go before plain opt-ins, and not-qualified leads go last", () =>
+  withWaitlist({ newContactLimit: 0 }, async (relay) => {
+    await relay.post(ghl(1, {}, "jean-optin,jean-applied"));
+    await relay.post(ghl(2, {}, "jean-optin,jean-applied,jean-not-qualified"));
+    await relay.post(ghl(3, {}, "jean-optin"));
+    await relay.post(ghl(4, {}, "jean-optin,ricky-booked")); // other creator's tag: ignored
+    relay.clearCalls();
+    relay.setNewContactLimit(5);
+    relay.newZeroSettleDay();
+    await relay.tick();
+    assert.deepEqual(relay.sentTo(), [phone(1), phone(4), phone(3), phone(2)]);
+  }));
+
+test("a status update moves a waiting lead up (applied, booked) or down (not qualified)", () =>
+  withWaitlist({ newContactLimit: 0 }, async (relay) => {
+    await optIn(relay, 1, 2, 3);
+    await relay.post(booking(1), { path: "/update" }); // no new tags yet: stays opted in
+    const up = await relay.post({ ...booking(1), tags: "jean-optin,jean-applied" }, { path: "/update" });
+    assert.equal((await up.json()).position, 1);
+    assert.ok(relay.tagCalls().includes("POST contact1 jean-imessage-priority"));
+
+    await relay.post({ ...booking(3), tags: "jean-optin,jean-not-qualified" }, { path: "/update" });
+    relay.clearCalls();
+    relay.setNewContactLimit(5);
+    relay.newZeroSettleDay();
+    await relay.tick();
+    assert.deepEqual(relay.sentTo(), [phone(1), phone(2), phone(3)]);
+  }));
+
+test("a status update that arrives before the opt-in message is remembered", () =>
+  withWaitlist({ newContactLimit: 0 }, async (relay) => {
+    await optIn(relay, 1);
+    const early = await relay.post({ ...booking(2), tags: "jean-optin,jean-applied" }, { path: "/update" });
+    assert.equal((await early.json()).status, "noted");
+    await relay.post(ghl(2, {}, "jean-optin")); // opt-in payload without the newer tag
+    await optIn(relay, 3);
+    relay.clearCalls();
+    relay.setNewContactLimit(5);
+    relay.newZeroSettleDay();
+    await relay.tick();
+    assert.deepEqual(relay.sentTo(), [phone(2), phone(3), phone(1)]);
+  }));
+
+test("applied leads don't wait for the noon batch", () =>
+  withWaitlist({ bindings: { HOLD_FROM_HOUR: "3", SEND_HOUR: "12" }, newContactLimit: 0 }, async (relay) => {
+    await relay.post(ghl(1, {}, "jean-optin"));
+    await relay.post(ghl(2, {}, "jean-optin,jean-applied"));
+    relay.clearCalls();
+    relay.setNewContactLimit(5);
+    relay.newZeroSettleDay();
+    await relay.tick(nyTime(1, 9));
+    assert.deepEqual(relay.sentTo(), [phone(2)]);
+  }));
+
+test("someone the line already texted is never sent a second opener, and uses no slot", () =>
+  withWaitlist({ newContactLimit: 1 }, async (relay) => {
+    relay.alreadyTexted(phone(1)); // e.g. texted by hand, or before the waitlist existed
+    const res = await relay.post(ghl(1));
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { status: "already_sent" });
+    assert.deepEqual(relay.zeroSettleCalls(), []);
+    assert.ok(relay.tagCalls().includes("POST contact1 jean-imessage-sent"));
+    assert.equal(new URL(relay.historyCalls()[0].url).searchParams.get("line_id"), "ln_test");
+
+    // The day's slot is still free for a new person.
+    assert.equal((await relay.post(ghl(2))).status, 200);
+    assert.deepEqual(relay.sentTo(), [phone(2)]);
+  }));
+
+test("re-running old leads through the workflow only texts the ones never texted", () =>
+  withWaitlist({ newContactLimit: 5 }, async (relay) => {
+    relay.alreadyTexted(phone(2));
+    relay.alreadyTexted(phone(4));
+    await optIn(relay, 1, 2, 3, 4, 5);
+    assert.deepEqual(relay.sentTo(), [phone(1), phone(3), phone(5)]);
+  }));
+
+test("if ZeroSettle's history can't be read, the message is still sent", () =>
+  withWaitlist({}, async (relay) => {
+    relay.setHistory(() => json(503, { error: { code: "unavailable" } }));
+    assert.equal((await relay.post(ghl(1))).status, 200);
+    assert.deepEqual(relay.sentTo(), [phone(1)]);
   }));

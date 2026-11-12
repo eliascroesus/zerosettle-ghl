@@ -8,10 +8,29 @@ workers_dev = true
 [observability]
 enabled = true
 
+# Ricky's worker runs the waitlist too (src/queue.js); see the trading worker below.
+# Hourly check: sends whoever fits, including the SEND_HOUR batch.
+[triggers]
+crons = ["0 * * * *"]
+
+[vars]
 # Ricky's ZeroSettle line, +1 (415) 595-8874. Without a line_id, ZeroSettle picks a line
 # itself on accounts with several numbers, so leads could go out from another creator's line.
-[vars]
 ZEROSETTLE_LINE_ID = "ln_5e26a0ae50f4ea21"
+# Priority comes from the contact's tags: ricky-booked > ricky-applied > opted in > ricky-not-qualified.
+CREATOR_TAG = "ricky"
+TIMEZONE = "America/New_York"
+HOLD_FROM_HOUR = "3"
+SEND_HOUR = "12"
+TAG_PREFIX = "ricky-imessage-"
+
+[[durable_objects.bindings]]
+name = "LEAD_QUEUE"
+class_name = "LeadQueue"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["LeadQueue"]
 
 # Secrets (not stored in this file):
 #   RELAY_SECRET       - value GoHighLevel must send in the "x-relay-secret" header
@@ -29,6 +48,8 @@ triggers = { crons = ["0 * * * *"] }
 [env.trading.vars]
 # Jean's ZeroSettle line, +1 (415) 802-3056.
 ZEROSETTLE_LINE_ID = "ln_08cecb430b9c9ae9"
+# Priority comes from the contact's tags: jean-booked > jean-applied > opted in > jean-not-qualified.
+CREATOR_TAG = "jean"
 TIMEZONE = "America/New_York"
 # ZeroSettle's day starts at 3 AM; from then until noon, opt-ins wait for the noon batch.
 HOLD_FROM_HOUR = "3"

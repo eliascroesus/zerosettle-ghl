@@ -11,7 +11,7 @@
  * - Direct (no LEAD_QUEUE binding): every message is sent immediately.
  * - Waitlist (LEAD_QUEUE bound): when ZeroSettle's daily new-contact limit is
  *   reached, leads wait their turn instead of being lost; see queue.js. POST to
- *   /booked when a lead books a call to move them to the front.
+ *   /update when a lead's tags change (applied, booked, not qualified).
  *
  * ZEROSETTLE_LINE_ID (a var) pins the sending line; see sendToZeroSettle in lib.js.
  *
@@ -49,10 +49,11 @@ export default {
     console.log("Incoming payload:", JSON.stringify(payload));
 
     const lead = readLead(payload);
-    const isBooking = env.LEAD_QUEUE && new URL(request.url).pathname.replace(/\/+$/, "") === "/booked";
+    const path = new URL(request.url).pathname.replace(/\/+$/, "");
+    const isUpdate = Boolean(env.LEAD_QUEUE) && (path === "/update" || path === "/booked");
 
-    // A booking webhook may leave out text (the lead's waiting message is used).
-    const missing = [!lead.to && "to", !isBooking && !lead.text.trim() && "text"].filter(Boolean);
+    // A status update may leave out text (the lead's opt-in message is used).
+    const missing = [!lead.to && "to", !isUpdate && !lead.text.trim() && "text"].filter(Boolean);
     if (missing.length > 0) {
       console.log(`Rejected request: missing ${missing.join(" and ")}`);
       return json(
@@ -71,7 +72,7 @@ export default {
     }
 
     const queue = leadQueue(env);
-    const result = isBooking ? await queue.booked(lead) : await queue.optIn(lead);
+    const result = isUpdate ? await queue.update(lead, { booked: path === "/booked" }) : await queue.optIn(lead);
     // When a message actually went to ZeroSettle (sent, or refused for good),
     // pass ZeroSettle's answer back. Otherwise report the waitlist status.
     if (result.zeroSettle && result.status !== "waiting") return zeroSettleResponse(result.zeroSettle);

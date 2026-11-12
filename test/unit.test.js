@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { localHour } from "../src/time.js";
-import { phoneKey, readLead, safeEqual, sendToZeroSettle, zeroSettleResponse } from "../src/lib.js";
+import { e164, phoneKey, readLead, safeEqual, sendToZeroSettle, zeroSettleResponse } from "../src/lib.js";
 
 const NY = "America/New_York";
 
@@ -16,11 +16,12 @@ test("localHour gives New York time in summer (EDT) and winter (EST)", () => {
 
 test("readLead takes customData.to, falls back to phone, and picks up contact id and name", () => {
   assert.deepEqual(
-    readLead({ contact_id: "c1", full_name: "Jane Doe", phone: "+1555", customData: { to: " +1666 ", text: "hi" } }),
-    { to: "+1666", text: "hi", contactId: "c1", name: "Jane Doe" },
+    readLead({ contact_id: "c1", full_name: "Jane Doe", phone: "+1555", tags: "Jean-Optin, jean-applied", customData: { to: " +1666 ", text: "hi" } }),
+    { to: "+1666", text: "hi", contactId: "c1", name: "Jane Doe", tags: ["jean-optin", "jean-applied"] },
   );
+  assert.deepEqual(readLead({ tags: ["a", "B"] }).tags, ["a", "b"]);
   assert.equal(readLead({ phone: "+1555", customData: { text: "hi" } }).to, "+1555");
-  assert.deepEqual(readLead(null), { to: "", text: "", contactId: "", name: "" });
+  assert.deepEqual(readLead(null), { to: "", text: "", contactId: "", name: "", tags: [] });
 });
 
 test("phoneKey ignores formatting", () => {
@@ -49,4 +50,10 @@ test("an unreachable ZeroSettle becomes a 502 for the caller", async () => {
     globalThis.fetch = realFetch;
     console.log = realLog;
   }
+});
+
+test("e164 turns GoHighLevel's phone formats into ZeroSettle handles", () => {
+  assert.equal(e164("(412) 522-6996"), "+14125226996");
+  assert.equal(e164("+1 548-239-3920"), "+15482393920");
+  assert.equal(e164("+44 7465 447272"), "+447465447272");
 });

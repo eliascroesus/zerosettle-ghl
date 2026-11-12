@@ -46,7 +46,13 @@ export async function startRelay({ waitlist = false, bindings = {}, zeroSettle, 
     }
     return json(200, { ok: true, status: "message_sent", record: { handle: body.to, line_id: body.line_id ?? null } });
   };
-  const state = { zeroSettle: zeroSettle ?? simulatedZeroSettle };
+  // GET /api/imessage/messages?handle=…: outbound history on the line.
+  const simulatedHistory = (url) => {
+    const key = new URL(url).searchParams.get("handle").replace(/\D/g, "");
+    const messages = line.known.has(key) ? [{ id: 1, direction: "out", handle: `+${key}`, status: "sent" }] : [];
+    return json(200, { messages, next_after_id: messages.length });
+  };
+  const state = { zeroSettle: zeroSettle ?? simulatedZeroSettle, history: simulatedHistory };
 
   const mf = new Miniflare({
     modules: true,
@@ -60,6 +66,7 @@ export async function startRelay({ waitlist = false, bindings = {}, zeroSettle, 
       ...(waitlist && {
         GHL_API_KEY: "ghl_test_key",
         ZEROSETTLE_LINE_ID: "ln_test",
+        CREATOR_TAG: "jean",
         TIMEZONE: "America/New_York",
         // No morning hold by default, so tests don't depend on the time they run at.
         HOLD_FROM_HOUR: "0",
@@ -80,7 +87,8 @@ export async function startRelay({ waitlist = false, bindings = {}, zeroSettle, 
       if (!call.url.startsWith("https://portal.zerosettle.io/")) {
         return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } });
       }
-      const response = await state.zeroSettle(call.body);
+      const response =
+        call.method === "GET" ? await state.history(call.url) : await state.zeroSettle(call.body);
       call.status = response.status;
       return response;
     },
@@ -103,7 +111,17 @@ export async function startRelay({ waitlist = false, bindings = {}, zeroSettle, 
     setNewContactLimit(n) {
       line.limit = n;
     },
-    zeroSettleCalls: () => calls.filter((c) => c.url.startsWith("https://portal.zerosettle.io/")),
+    /** Someone this line already texted before (by hand, or before the waitlist). */
+    alreadyTexted(phoneNumber) {
+      line.known.add(phoneNumber.replace(/\D/g, ""));
+    },
+    /** Swap ZeroSettle's history answer; null goes back to the simulated API. */
+    setHistory(fn) {
+      state.history = fn ?? simulatedHistory;
+    },
+    historyCalls: () => calls.filter((c) => c.method === "GET" && c.url.includes("/api/imessage/messages")),
+    /** Send attempts only (not history lookups). */
+    zeroSettleCalls: () => calls.filter((c) => c.method === "POST" && c.url.startsWith("https://portal.zerosettle.io/")),
     /** Everyone ZeroSettle was asked to message, accepted or not. */
     triedTo: () => relay.zeroSettleCalls().map((c) => c.body.to),
     /** Everyone ZeroSettle actually messaged. */
@@ -136,9 +154,10 @@ export async function startRelay({ waitlist = false, bindings = {}, zeroSettle, 
 }
 
 /** GoHighLevel standard Webhook payload (trimmed). */
-export function ghl(n, customData = {}) {
+export function ghl(n, customData = {}, tags = "jean-optin") {
   return {
     contact_id: `contact${n}`,
+    tags,
     first_name: `Lead${n}`,
     full_name: `Lead${n} Test`,
     phone: `+1555000000${n}`,
