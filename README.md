@@ -54,7 +54,8 @@ ZeroSettle's Pro plan allows **5 new contacts a day per line**, reset at **3 AM 
   1. `jean-booked`
   2. `jean-applied`
   3. opted in
-  4. `jean-not-qualified`
+
+  `jean-not-qualified` leads are never texted. If that tag is removed and they apply or book again, they go back in line.
 
   Tags arrive with every webhook. A "status changed" workflow (trigger: `-applied`, `-booked` or `-not-qualified` added) POSTs to `/update` so the order stays current. An update that arrives before the opt-in message is remembered.
 - **Never twice:** before a first message, the worker checks the line's ZeroSettle history for that number. If someone was already texted (by hand, or before the waitlist), they're marked sent and use no slot. So old leads can be re-run through the opt-in workflow safely.

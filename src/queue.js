@@ -16,7 +16,7 @@ import { localHour } from "./time.js";
  * - Before a first message the line's ZeroSettle history is checked, so nobody is
  *   texted twice (safe to re-run old leads through the workflows).
  * - Order: by tier from the contact's GoHighLevel tags (CREATOR_TAG + "-booked" >
- *   "-applied" > opted in > "-not-qualified"), then newest first. Tags come with
+ *   "-applied" > opted in), then newest first. "-not-qualified" leads are never texted. Tags come with
  *   every webhook; POST /update (or /booked) when they change.
  * - From HOLD_FROM_HOUR (3, when ZeroSettle's day resets) until SEND_HOUR (12),
  *   in TIMEZONE, opt-ins wait so the new day's slots go out as one batch at
@@ -40,7 +40,7 @@ export class LeadQueue extends DurableObject {
         contact_id  TEXT,
         name        TEXT,
         text        TEXT,
-        status      TEXT NOT NULL,             -- waiting | sent | failed | pending (tier known, message not in yet)
+        status      TEXT NOT NULL,             -- waiting | sent | failed | skipped (not qualified) | pending (tier known, message not in yet)
         priority    INTEGER NOT NULL DEFAULT 1, -- tier: 3 booked, 2 applied, 1 opted in, 0 not qualified
         opted_in_at INTEGER NOT NULL,
         sent_at     INTEGER,
@@ -85,6 +85,7 @@ export class LeadQueue extends DurableObject {
       return { status: zeroSettle.ok ? "sent" : "failed", followUp: true, zeroSettle };
     }
     if (existing?.status === "waiting") {
+      if (this.#tier(lead) === NOT_QUALIFIED) return this.#skip(key, lead, { wasWaiting: true });
       await this.#setPriority(existing, this.#tier(lead));
       console.log(`${lead.to} is already on the waitlist: skipping this message until their first one is sent`);
       return { status: "waiting", note: "Already on the waitlist; this message was skipped.", ...this.#position(key) };
@@ -95,6 +96,7 @@ export class LeadQueue extends DurableObject {
     const tier = this.#tier(lead);
     const priority = tier === 0 ? 0 : Math.max(tier, pending);
     this.#upsertWaiting(key, lead, { text: lead.text, priority, optedInAt: now });
+    if (priority === NOT_QUALIFIED) return this.#skip(key, lead);
     const drained = await this.#drain(now);
     return this.#outcomeFor(key, lead, drained);
   }
@@ -115,9 +117,17 @@ export class LeadQueue extends DurableObject {
     }
     if (existing?.status === "waiting") {
       if (lead.text.trim()) this.sql.exec(`UPDATE leads SET text = ? WHERE phone_key = ?`, lead.text, key);
+      if (tier === NOT_QUALIFIED) return this.#skip(key, lead, { wasWaiting: true });
       await this.#setPriority(existing, tier);
       console.log(`${lead.to} is now ${TIER_NAMES[tier]}: their place in line is updated`);
+    } else if (existing?.status === "skipped") {
+      if (tier === NOT_QUALIFIED) return { status: "skipped" };
+      // No longer marked not qualified: back in line with the message they opted in with.
+      console.log(`${lead.to} is now ${TIER_NAMES[tier]}: back on the waitlist`);
+      const text = lead.text.trim() ? lead.text : existing.text;
+      this.#upsertWaiting(key, lead, { text, priority: tier, optedInAt: existing.opted_in_at });
     } else if (lead.text.trim()) {
+      if (tier === NOT_QUALIFIED) return { status: "skipped" };
       this.#upsertWaiting(key, lead, { text: lead.text, priority: tier, optedInAt: now });
     } else {
       // Their first message hasn't reached us yet (e.g. the opt-in workflow is still in its
@@ -282,6 +292,17 @@ export class LeadQueue extends DurableObject {
     );
   }
 
+  /** Not qualified: never texted. Kept (status skipped) in case the tag is removed later. */
+  async #skip(key, lead, { wasWaiting = false } = {}) {
+    this.sql.exec(`UPDATE leads SET status = 'skipped' WHERE phone_key = ?`, key);
+    console.log(`${lead.to} is not qualified: not texting them`);
+    if (wasWaiting) {
+      const row = this.#lead(key);
+      await updateTags(this.env, row.contact_id, { remove: ["waiting", "priority"] });
+    }
+    return { status: "skipped", note: "Not qualified, so they won't be texted." };
+  }
+
   /** Tier from the contact's tags, e.g. "jean-booked" with CREATOR_TAG "jean". */
   #tier(lead) {
     const creator = (this.env.CREATOR_TAG ?? "").toLowerCase();
@@ -340,6 +361,7 @@ export class LeadQueue extends DurableObject {
 }
 
 const TIER_NAMES = ["not qualified", "opted in", "applied", "booked a call"];
+const NOT_QUALIFIED = 0;
 // Applied and booked leads (and anyone with an equal or higher tier) go out as soon as
 // there is room; others wait for the SEND_HOUR batch during the morning hold.
 const SKIPS_HOLD = 2;
