@@ -435,3 +435,12 @@ test("re-running a waiting lead who is now not qualified takes them off the list
     await relay.tick();
     assert.deepEqual(relay.sentTo(), []);
   }));
+
+test("re-running someone who already got the opener never sends it again", () =>
+  withWaitlist({}, async (relay) => {
+    await optIn(relay, 1);
+    const again = await relay.post(ghl(1));
+    assert.deepEqual(await again.json(), { status: "already_sent" });
+    await relay.post(ghl(1, { text: "  hi   LEAD1! " }));
+    assert.deepEqual(relay.sentTo(), [phone(1)]);
+  }));

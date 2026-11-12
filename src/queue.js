@@ -80,7 +80,12 @@ export class LeadQueue extends DurableObject {
     const existing = this.#lead(key);
 
     if (existing?.status === "sent") {
-      console.log(`${lead.to} was already messaged: sending this follow-up now (doesn't count as a new contact)`);
+      // The same opener again (a re-run, re-entry, or a duplicate webhook): never resend it.
+      if (sameText(lead.text, existing.text)) {
+        console.log(`${lead.to} already got this message: not sending it again`);
+        return { status: "already_sent" };
+      }
+      console.log(`${lead.to} was already messaged: sending this different follow-up now (doesn't count as a new contact)`);
       const zeroSettle = await sendToZeroSettle(this.env, lead.to, lead.text);
       return { status: zeroSettle.ok ? "sent" : "failed", followUp: true, zeroSettle };
     }
@@ -365,6 +370,12 @@ const NOT_QUALIFIED = 0;
 // Applied and booked leads (and anyone with an equal or higher tier) go out as soon as
 // there is room; others wait for the SEND_HOUR batch during the morning hold.
 const SKIPS_HOLD = 2;
+
+/** Same message, ignoring spacing and case. */
+function sameText(a, b) {
+  const norm = (t) => (t ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+  return norm(a) === norm(b);
+}
 
 /** Rows from older versions used status 'booked' for what is now 'pending'. */
 function isPending(row) {
