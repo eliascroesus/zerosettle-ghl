@@ -19,9 +19,9 @@ crons = ["0 * * * *"]
 ZEROSETTLE_LINE_ID = "ln_5e26a0ae50f4ea21"
 # Priority comes from the contact's tags: ricky-booked > ricky-applied > opted in > ricky-not-qualified.
 CREATOR_TAG = "ricky"
-TIMEZONE = "America/New_York"
-HOLD_FROM_HOUR = "3"
-SEND_HOUR = "12"
+TIMEZONE = "Europe/London"
+HOLD_FROM_HOUR = "8"
+SEND_HOUR = "9"
 TAG_PREFIX = "ricky-imessage-"
 
 [[durable_objects.bindings]]
@@ -50,10 +50,11 @@ triggers = { crons = ["0 * * * *"] }
 ZEROSETTLE_LINE_ID = "ln_08cecb430b9c9ae9"
 # Priority comes from the contact's tags: jean-booked > jean-applied > opted in > jean-not-qualified.
 CREATOR_TAG = "jean"
-TIMEZONE = "America/New_York"
-# ZeroSettle's day starts at 3 AM; from then until noon, opt-ins wait for the noon batch.
-HOLD_FROM_HOUR = "3"
-SEND_HOUR = "12"
+TIMEZONE = "Europe/London"
+# ZeroSettle's day starts at 3 AM New York = 8 AM London; from then until 9 AM London,
+# opt-ins wait for the 9 AM batch.
+HOLD_FROM_HOUR = "8"
+SEND_HOUR = "9"
 TAG_PREFIX = "jean-imessage-"
 
 [[env.trading.durable_objects.bindings]]
