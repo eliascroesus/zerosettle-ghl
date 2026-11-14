@@ -21,7 +21,7 @@ ZEROSETTLE_LINE_ID = "ln_5e26a0ae50f4ea21"
 CREATOR_TAG = "ricky"
 TIMEZONE = "Europe/London"
 HOLD_FROM_HOUR = "8"
-SEND_HOUR = "9"
+SEND_HOUR = "12"
 TAG_PREFIX = "ricky-imessage-"
 
 [[durable_objects.bindings]]
@@ -51,10 +51,10 @@ ZEROSETTLE_LINE_ID = "ln_08cecb430b9c9ae9"
 # Priority comes from the contact's tags: jean-booked > jean-applied > opted in > jean-not-qualified.
 CREATOR_TAG = "jean"
 TIMEZONE = "Europe/London"
-# ZeroSettle's day starts at 3 AM New York = 8 AM London; from then until 9 AM London,
-# opt-ins wait for the 9 AM batch.
+# ZeroSettle's day starts at 3 AM New York = 8 AM London; from then until noon London,
+# opt-ins wait for the noon batch.
 HOLD_FROM_HOUR = "8"
-SEND_HOUR = "9"
+SEND_HOUR = "12"
 TAG_PREFIX = "jean-imessage-"
 
 [[env.trading.durable_objects.bindings]]

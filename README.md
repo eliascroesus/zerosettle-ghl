@@ -59,7 +59,7 @@ ZeroSettle's Pro plan allows **5 new contacts a day per line**, reset at **3 AM 
 
   Tags arrive with every webhook. A "status changed" workflow (trigger: `-applied`, `-booked` or `-not-qualified` added) POSTs to `/update` so the order stays current. An update that arrives before the opt-in message is remembered.
 - **Never twice:** before a first message, the worker checks the line's ZeroSettle history for that number. If someone was already texted (by hand, or before the waitlist), they're marked sent and use no slot. So old leads can be re-run through the opt-in workflow safely.
-- **Noon batch:** from `HOLD_FROM_HOUR` (8 AM, when ZeroSettle's day starts) until `SEND_HOUR` (9 AM), in `TIMEZONE` (Europe/London), opt-ins wait. ZeroSettle's 3 AM New York reset is 8 AM London. That way the fresh day's slots go out together at 9 AM London in waitlist order. Applied and booked leads don't wait for the batch. An hourly cron sends the batch and retries anything temporary.
+- **Noon batch:** from `HOLD_FROM_HOUR` (8 AM, when ZeroSettle's day starts) until `SEND_HOUR` (noon), in `TIMEZONE` (Europe/London), opt-ins wait. ZeroSettle's 3 AM New York reset is 8 AM London. That way the fresh day's slots go out together at noon London in waitlist order. Applied and booked leads don't wait for the batch. An hourly cron sends the batch and retries anything temporary.
 - **Booked calls:** a GoHighLevel workflow (trigger: tag `jean-booked` added) sends a Webhook to `/booked` with the same header and no `text`. Depending on where the lead is:
   - Still waiting: they move to the front.
   - Booked before their opt-in message arrived (the opt-in workflow waits 3 minutes): the booking is remembered, and they go to the front when the message arrives.
